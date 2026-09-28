@@ -772,6 +772,13 @@ STUB_TEMPLATE = """\
 #!/usr/bin/env bash
 # herdr-hibernate stub for pane {pane_id} — session {uuid}
 # Auto-generated. Deleting this file only disables auto-resume for that pane.
+# Herdr lists a pane in its agent panel only while the foreground process is an
+# agent. HERDR_AGENT makes Herdr treat this stub as {agent}, so the hibernated
+# session stays in the panel. The stub runs as a child of the pane's shell, so
+# this exec replaces only the stub itself.
+if [ "${{HERDR_AGENT:-}}" != {agent} ]; then
+    HERDR_AGENT={agent} _HB_AGENT_HINT=1 exec bash "$0"
+fi
 shopt -s execfail
 _hb_reset_terminal() {{
     stty sane 2>/dev/null || true
@@ -793,12 +800,18 @@ trap _hb_bye INT
 _hb_stub() {{
     export HERDR_HIBERNATE_STUB=1
     _hb_reset_terminal
+    # The pane's terminal title names its row in Herdr's agent panel.
+    printf '\033]2;%s\007' {title}
     cd {cwd} 2>/dev/null || cd "$HOME" || return 0
     printf '\\n\\033[1;35m%s\\033[0m\\n' {banner}
     printf '\\033[2m%s\\033[0m\\n\\n' {subtitle}
     IFS= read -r _ || return 0
     printf 'resuming session %s (takes 10-20s)...\\n' {uuid}
     {tool} label-awake {pane_id} >/dev/null 2>&1
+    # The hint was for the stub; the resumed agent is detected by its own name.
+    if [ -n "${{_HB_AGENT_HINT:-}}" ]; then
+        unset HERDR_AGENT _HB_AGENT_HINT
+    fi
     # NOTE: the record and this script are deliberately NOT deleted here. The
     # reaper clears them once it sees the agent actually live in the pane, so a
     # failed resume (or a Herdr restart mid-resume) still leaves the pane armed.
@@ -850,6 +863,13 @@ def resume_argv(rec):
     return [tok.format(sid=rec["uuid"], cwd=cwd) for tok in spec["resume_argv"]]
 
 
+def stub_title(rec):
+    """Terminal title of a waiting stub: the session's own title, asleep."""
+    title = rec.get("title") or rec.get("label") or rec.get("uuid", "")
+    title = re.sub(r"[\x00-\x1f\x7f]", "", title).strip()
+    return ("💤 %s" % title)[:80]
+
+
 def write_stub_file(pane_id, rec):
     """(Re)write the pane's stub script from its state record. Returns its path."""
     os.makedirs(PANES_DIR, exist_ok=True)
@@ -868,6 +888,8 @@ def write_stub_file(pane_id, rec):
         banner=shlex.quote(banner),
         subtitle=shlex.quote(subtitle),
         tool=shlex.quote(SELF),
+        agent=shlex.quote(rec.get("agent", "claude")),
+        title=shlex.quote(stub_title(rec)),
     )
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -988,6 +1010,57 @@ def toast(title, body="", sound="none"):
     try:
         herdr(*args)
     except (RuntimeError, OSError):
+        pass
+
+
+PANEL_SOURCE = "bengemine.hibernate"
+
+
+def mark_hibernated(pane_id, agent):
+    """Show a hibernated pane as "hibernated" in Herdr's agent panel.
+
+    The stub keeps the pane in the panel as `agent` (see STUB_TEMPLATE); this
+    replaces its idle/done status text. Herdr keeps the label until it is
+    cleared, applied only while the pane's agent is `agent`. `unknown` covers
+    the moment before Herdr has classified the stub.
+    """
+    try:
+        herdr("pane", "report-metadata", pane_id, "--source", PANEL_SOURCE,
+              "--agent", agent, "--state-label", "idle=hibernated",
+              "--state-label", "done=hibernated",
+              "--state-label", "unknown=hibernated")
+    except RuntimeError:
+        pass
+
+
+def mark_when_listed(pane_id, agent, timeout=5.0):
+    """Label a freshly armed stub once Herdr lists it as `agent`.
+
+    A label reported earlier belongs to the agent that was just killed, and
+    Herdr drops it when the stub takes the pane. The watcher re-labels waiting
+    stubs on every pass, so a stub still unlisted at the timeout is labelled
+    then.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            pane = herdr("pane", "get", pane_id).get("pane", {})
+        except RuntimeError:
+            return
+        if pane.get("agent") == agent and stub_alive(pane_process_info(pane_id)):
+            mark_hibernated(pane_id, agent)
+            return
+        if time.time() >= deadline:
+            return
+        time.sleep(0.25)
+
+
+def clear_hibernated(pane_id):
+    """Drop the "hibernated" label, so the resumed agent shows its own status."""
+    try:
+        herdr("pane", "report-metadata", pane_id, "--source", PANEL_SOURCE,
+              "--clear-state-labels")
+    except RuntimeError:
         pass
 
 
@@ -1149,6 +1222,7 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
         "uuid": uuid, "agent": agent,
         "resume": build_resume(agent, uuid, proc, cwd),
         "tab_id": tab_id, "label": original_label, "cwd": cwd,
+        "title": pane.get("terminal_title_stripped") or "",
         "marker_added": marker_added, "marked_label": marked_label,
         "freed_mb": rss_mb, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -1158,6 +1232,7 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
     save_state(state)
     write_stub_file(pane_id, rec)
     herdr("pane", "run", pane_id, stub_command(pane_id))
+    mark_when_listed(pane_id, agent)
     try:
         if marked_label and label != marked_label:
             herdr("tab", "rename", tab_id, marked_label)
@@ -1291,6 +1366,7 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
             if not dry_run:
                 fresh = not os.path.exists(pane_file(pane_id))
                 write_stub_file(pane_id, rec)
+                mark_hibernated(pane_id, rec.get("agent", "claude"))
                 if fresh:
                     log("ARMED %s (%s): wrote stub script for reboot recovery"
                         % (label, pane_id), echo=False)
@@ -1303,6 +1379,7 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
                 if not restore_owned_tab_label(pane_id, pane, rec, state):
                     continue
                 log("RESUMED %s (%s)" % (label, pane_id), echo=False)
+                clear_hibernated(pane_id)
                 del state[pane_id]
                 remove_stub_file(pane_id)
                 save_state(state)
@@ -1328,6 +1405,7 @@ def restore_records(panes, tab_labels, state, dry_run=False, forget_after=15.0):
         except RuntimeError as exc:  # pane vanished mid-sweep; try again later
             log("SKIP restore %s (%s): %s" % (label, pane_id, exc))
             continue
+        mark_when_listed(pane_id, rec.get("agent", "claude"))
         tab_id = pane.get("tab_id", rec.get("tab_id", ""))
         cur_label = tab_labels.get(tab_id, "")
         if tab_id and label and not cur_label.startswith("💤"):
@@ -1532,6 +1610,7 @@ def cmd_label_awake(pane_id):
     rec = state.get(pane_id)
     if not rec:
         return
+    clear_hibernated(pane_id)
     try:
         pane = herdr("pane", "get", pane_id).get("pane", {})
     except RuntimeError:

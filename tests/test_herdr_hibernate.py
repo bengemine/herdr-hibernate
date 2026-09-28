@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -190,6 +191,124 @@ class HibernateTests(unittest.TestCase):
         self.assertLess(command.index("stty sane"), command.index("bash "))
         self.assertIn("\\033[?1004l", command)
         self.assertNotIn("clear", command)
+
+
+class AgentPanelTests(unittest.TestCase):
+    """A hibernated pane stays in Herdr's agent panel, labelled hibernated."""
+
+    setUp = HibernateTests.setUp
+    tearDown = HibernateTests.tearDown
+
+    SID = "11111111-1111-1111-1111-111111111111"
+
+    def _run_stub(self, env_extra=None):
+        """Run a real stub with a fake tool and a resume that reports its env."""
+        root = self.tempdir.name
+        tool = os.path.join(root, "fake-tool")
+        seen = os.path.join(root, "seen")
+        with open(tool, "w", encoding="utf-8") as fh:
+            fh.write('#!/bin/sh\necho "tool=${HERDR_AGENT-unset}" >> %s\n'
+                     % seen)
+        os.chmod(tool, 0o755)
+        rec = {
+            "uuid": self.SID, "agent": "codex", "cwd": root, "freed_mb": 1,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "resume": ["sh", "-c",
+                       'echo "resume=${HERDR_AGENT-unset} '
+                       'hint=${_HB_AGENT_HINT-unset}" >> %s' % seen],
+        }
+        with mock.patch.object(hibernate, "SELF", tool):
+            path = hibernate.write_stub_file("w1:p1", rec)
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("HERDR_AGENT", "_HB_AGENT_HINT")}
+        env.update(env_extra or {})
+        subprocess.run(["bash", path], input="\n", text=True, env=env,
+                       capture_output=True, timeout=30, check=True)
+        with open(seen, encoding="utf-8") as fh:
+            return fh.read().splitlines()
+
+    def test_stub_runs_as_the_agent_and_the_resume_does_not(self):
+        self.assertEqual(self._run_stub(),
+                         ["tool=codex", "resume=unset hint=unset"])
+
+    def test_stub_keeps_an_agent_hint_the_user_set(self):
+        self.assertEqual(self._run_stub({"HERDR_AGENT": "codex"}),
+                         ["tool=codex", "resume=codex hint=unset"])
+
+    def test_stub_titles_the_pane_with_the_sessions_own_title(self):
+        self.assertEqual(hibernate.stub_title(
+            {"title": "Fix the parser", "label": "tab"}), "💤 Fix the parser")
+        # Records from older versions have no title: the tab label stands in.
+        self.assertEqual(hibernate.stub_title({"label": "tab"}), "💤 tab")
+        # A title is terminal input: control characters never reach it.
+        self.assertEqual(hibernate.stub_title(
+            {"title": "a\x1b]0;x\x07b"}), "💤 a]0;xb")
+
+    def test_mark_labels_every_waiting_state_for_the_agent_only(self):
+        calls = []
+        with mock.patch.object(hibernate, "herdr",
+                               side_effect=lambda *a: calls.append(a) or {}):
+            hibernate.mark_hibernated("w1:p1", "claude")
+        self.assertEqual(calls, [(
+            "pane", "report-metadata", "w1:p1",
+            "--source", hibernate.PANEL_SOURCE, "--agent", "claude",
+            "--state-label", "idle=hibernated",
+            "--state-label", "done=hibernated",
+            "--state-label", "unknown=hibernated")])
+
+    def test_label_waits_until_herdr_lists_the_stub(self):
+        # First the killed agent is still on record, then the stub is listed.
+        stub = {"foreground_processes": [
+            {"cmdline": "bash %s/w1_p1.sh" % hibernate.STUB_MARKERS[0]}]}
+        dead = {"foreground_processes": [{"cmdline": "bash"}]}
+        infos = iter([dead, stub])
+        calls = []
+        with mock.patch.object(hibernate, "herdr",
+                               side_effect=lambda *a: calls.append(a) or
+                               {"pane": {"agent": "claude"}}), \
+                mock.patch.object(hibernate, "pane_process_info",
+                                  side_effect=lambda _: next(infos)), \
+                mock.patch.object(hibernate.time, "sleep"):
+            hibernate.mark_when_listed("w1:p1", "claude")
+        marks = [c for c in calls if c[1] == "report-metadata"]
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(calls[-1], marks[0])
+
+    def test_label_gives_up_quietly_when_the_stub_is_never_listed(self):
+        calls = []
+        with mock.patch.object(hibernate, "herdr",
+                               side_effect=lambda *a: calls.append(a) or
+                               {"pane": {}}), \
+                mock.patch.object(hibernate, "pane_process_info",
+                                  return_value=None):
+            hibernate.mark_when_listed("w1:p1", "claude", timeout=0)
+        self.assertNotIn("report-metadata", [c[1] for c in calls])
+
+    def test_panel_labels_never_raise(self):
+        with mock.patch.object(hibernate, "herdr",
+                               side_effect=RuntimeError("pane gone")):
+            hibernate.mark_hibernated("w1:p1", "claude")
+            hibernate.clear_hibernated("w1:p1")
+
+    def test_resume_clears_the_label_before_the_agent_starts(self):
+        state = {"w1:p1": {"tab_id": "w1:t1", "label": "Tab",
+                           "marker_added": False, "marked_label": ""}}
+        hibernate.save_state(state)
+        calls = []
+
+        def fake_herdr(*args):
+            calls.append(args)
+            if args[:2] == ("pane", "get"):
+                return {"pane": {"tab_id": "w1:t1"}}
+            if args[:2] == ("tab", "get"):
+                return {"tab": {"label": "Tab"}}
+            return {}
+
+        with mock.patch.object(hibernate, "herdr", side_effect=fake_herdr):
+            hibernate.cmd_label_awake("w1:p1")
+        self.assertIn(("pane", "report-metadata", "w1:p1",
+                       "--source", hibernate.PANEL_SOURCE,
+                       "--clear-state-labels"), calls)
 
 
 class WatcherGuardTests(unittest.TestCase):

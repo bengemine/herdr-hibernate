@@ -264,11 +264,20 @@ wake-up always lands before the pane can qualify.
    `💤 hibernated 2h14m ago (freed ~880MB) — press Enter to resume`.
    It is one small bash process waiting on stdin.
 6. The tab is renamed `💤 <old label>` so hibernated tabs are obvious.
+7. The pane stays in Herdr's agent panel, named `💤 <session title>`. Herdr
+   lists a pane there only while its foreground process is an agent, so the
+   stub runs with `HERDR_AGENT=<agent>` (Herdr's hint for a wrapper process)
+   and sets the terminal title to the session's title from before the kill.
+   Its status text reads `hibernated` (pane metadata state labels, shown by a
+   `state_text` row in `[ui.sidebar.agents]`); the watcher re-reports that
+   label on every scan, so a Herdr restart does not lose it.
 
 ## Resume
 
-Press Enter in the pane. The stub restores the tab label and
-`exec claude --resume <uuid>` in the pane's original cwd.
+Press Enter in the pane. The stub restores the tab label, clears the
+`hibernated` status text, drops the `HERDR_AGENT` hint (the resumed agent is
+detected by its own name) and `exec claude --resume <uuid>` in the pane's
+original cwd.
 
 - Resume takes **10–20 s** (claude startup plus MCP servers spawning).
 - The **first reply after resume is slower** than usual (cold prompt cache).
