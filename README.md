@@ -13,6 +13,12 @@ Supported agents:
 | Claude Code | `claude --resume <uuid>` | 650–930 MB |
 | Codex CLI | `codex resume <uuid>` | ~550 MB (multi-GB after sub-agent runs) |
 | Grok (xAI Grok Build) | `grok --resume <uuid> --cwd <dir>` | ~35 MB + your MCP servers (~500 MB typical) |
+| Droid (Factory) | `droid --resume <uuid>` | varies (agent + MCP children) |
+| pi | `pi --session <uuid>` | varies |
+| opencode | `opencode --session <ses_id>` | varies |
+| cursor-agent | `cursor-agent --resume <chatId>` | varies |
+| Devin CLI | `devin --resume <id>` | varies |
+| Amp (Sourcegraph) | `amp threads continue <threadId>` | varies |
 
 Only agents with a proven on-disk resume path are ever touched; anything else
 is exempt — killing a session that cannot be resumed would lose the
@@ -82,6 +88,34 @@ past the threshold — and re-checks the status immediately before killing.
   Not restored by grok on resume (grok's design, not this tool's): background
   tasks, plan-mode state, and staged/unstaged changes under `--restore-code`;
   MCP servers are re-initialized from grok's config.
+- **Droid**: transcript at `~/.factory/sessions/**/<uuid>.jsonl`;
+  `droid --resume <uuid>` restores the conversation.
+- **pi**: transcript at
+  `~/.pi/agent/sessions/--<cwd-slug>--/<timestamp>_<uuid>.jsonl`;
+  `pi --session <uuid>` restores the conversation.
+- **opencode**: session records under
+  `~/.local/share/opencode/project/<cwd-slug>/storage/session/` (`info/`,
+  `message/`, `part/`; `ses_*` ids) or the legacy
+  `storage/session/<hash>/<ses_*.json>` layout;
+  `opencode --session <ses_id>` restores the conversation.
+- **cursor-agent**: chat dir at `~/.cursor/chats/<chatId>/<composer>/`;
+  `meta.json` records the chat's cwd; `cursor-agent --resume <chatId>`
+  restores the conversation.
+- **Devin CLI**: session rows in
+  `~/.local/share/devin/cli/sessions.db` carry `id`, `working_directory`,
+  and `last_activity_at` — the db is both the resume proof and the idle
+  clock (transcript files only exist for exported sessions);
+  `devin --resume <id>` restores the conversation.
+- **Amp**: thread file at `~/.local/share/amp/threads/T-<uuid>.json`, with
+  the workspace dir in `env.initial.trees[].uri`; `amp threads continue
+  <threadId>` restores the conversation.
+
+For agents Herdr does not report a session id for (everything except Claude
+Code and Codex), the id is recovered from the agent's own on-disk state,
+keyed by the pane's working directory — newest transcript wins. When two or
+more sessions in the same directory are all past the idle threshold, the
+live one is unknowable and the pane is skipped: a kill on a guessed id could
+resume the wrong conversation in front of the user.
 
 ## Usage
 
@@ -502,8 +536,13 @@ herdr plugin install bengemine/herdr-hibernate --yes
   run `install` again from a live pane.
 - Tab-id pins (`PINNED_TABS`) do not survive Herdr restarts; label-marker
   pins do.
-- Handles Claude Code, Codex, and Grok. Other agents are exempt until they
-  have a proven resume path.
+- Handles Claude Code, Codex, Grok, Droid, pi, opencode, cursor-agent,
+  Devin CLI, and Amp. Other agents (e.g. hermes, gemini) are exempt until
+  they have a proven resume path.
+- For agents without a Herdr-reported session id, the id is recovered from
+  on-disk state by pane cwd — newest transcript wins, and several
+  equally-quiet sessions in one directory make the pane unresolvable
+  (skipped, never killed).
 - While Codex runs sub-agents, its parent transcript can look stale; the
   `working` status guard (hook-driven) is what protects those panes.
 - macOS is untested (see [Install](#install)).

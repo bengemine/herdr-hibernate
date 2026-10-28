@@ -3,9 +3,10 @@
 
 Kills the agent process tree of idle panes (freeing 500 MB-2 GB each) and
 replaces it with a tiny bash stub that resumes the exact session on Enter.
-Supports Claude Code, Codex, and Grok; only agents with a proven on-disk
-resume path are ever touched. Hibernation never closes a pane or tab; only
-auto-settle does (AUTO_SETTLE_AFTER_DAYS). Dry-run by default.
+Supports Claude Code, Codex, Grok, Droid, pi, opencode, cursor-agent,
+Devin CLI, and Amp; only agents with a proven on-disk resume path are ever
+touched. Hibernation never closes a pane or tab; only auto-settle does
+(AUTO_SETTLE_AFTER_DAYS). Dry-run by default.
 
 Hibernation survives reboots: each hibernated pane gets a stub script under
 ~/.config/herdr-hibernate/panes/. A .bashrc hook re-arms that stub the moment
@@ -40,6 +41,7 @@ import shlex
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -87,7 +89,8 @@ VIEWS = (
 # conversation, so unknown agents are exempt.
 #
 #   transcript_glob  where the session's on-disk transcript lives ({sid} = the
-#                    id Herdr reports in agent_session.value)
+#                    id Herdr reports in agent_session.value). A string or a
+#                    tuple of alternatives — any match proves resumability.
 #   bin              executable name; used to spot the agent among the pane's
 #                    foreground processes (argv[0] or argv[1] basename, so a
 #                    `node .../bin/codex` wrapper matches too)
@@ -99,6 +102,16 @@ VIEWS = (
 #                    to resume_argv, so a resume keeps e.g. the model override
 #   activity_globs   extra files whose timestamped writes count as session
 #                    activity even though the main transcript is untouched
+#   num_ts_fields    JSON fields carrying a numeric epoch stamp (auto-scaled
+#                    seconds vs milliseconds) — for transcripts that do not use
+#                    an ISO "timestamp" (or mix ISO and numeric stamps)
+#   sid_re           fullmatch regex a session id must satisfy (default UUID_RE)
+#                    — an id that can resolve ambiguously is never killed
+#   sid_fn           name in SESSION_ID_FNS of a resolver that recovers the
+#                    session id when Herdr reports no agent_session (e.g. from
+#                    the agent's own registry or transcript dirs, by cwd)
+#   age_fn           name in AGE_FNS of a custom idle-age probe, for agents
+#                    whose transcript is not a plain file of stamped entries
 AGENTS = {
     "claude": {
         "transcript_glob": os.path.expanduser("~/.claude/projects/*/{sid}.jsonl"),
@@ -148,7 +161,110 @@ AGENTS = {
         # grok transcripts stamp entries with epoch integers, not ISO strings.
         # Only enabled here: a numeric "timestamp" inside claude/codex tool
         # output must not be mistaken for an entry timestamp.
-        "epoch_ts": True,
+        "num_ts_fields": ("timestamp",),
+        "sid_fn": "grok",
+    },
+    "droid": {
+        # Factory Droid. Sessions live in ~/.factory/sessions/<uuid>.jsonl and
+        # in per-directory subdirs; both layouts resume by uuid.
+        "transcript_glob": (
+            os.path.expanduser("~/.factory/sessions/*/{sid}.jsonl"),
+            os.path.expanduser("~/.factory/sessions/{sid}.jsonl"),
+        ),
+        "bin": "droid",
+        "resume_argv": ["droid", "--resume", "{sid}"],
+        "session_in_args": r"(?:--resume|-r|resume)\s+(%s)" % UUID_RE,
+        "helper_tokens": (),
+        "replay_flags": (),
+        "sid_fn": "droid",
+    },
+    "pi": {
+        # Session files sit under a per-cwd dir and embed the uuid in the name:
+        # ~/.pi/agent/sessions/--cwd-slug--/<ts>_<uuid>.jsonl. Stamps are ISO
+        # strings AND epoch-ms ints on the same "timestamp" field.
+        "transcript_glob": os.path.expanduser(
+            "~/.pi/agent/sessions/*/*_{sid}.jsonl"),
+        "num_ts_fields": ("timestamp",),
+        "bin": "pi",
+        "resume_argv": ["pi", "--session", "{sid}"],
+        "session_in_args": r"--session\s+(%s)" % UUID_RE,
+        # `--no-session` writes nothing: killing it could only resume an
+        # older session in that directory — the wrong conversation.
+        "helper_tokens": ("--no-session",),
+        "replay_flags": (),
+        "sid_fn": "pi",
+    },
+    "opencode": {
+        # Project sessions: project/<cwd-slug>/storage/session/info/{sid}.json
+        # (sid = ses_*), plus the legacy storage/session/<hash>/{sid}.json
+        # layout. Message/part files are the activity signal.
+        "transcript_glob": (
+            os.path.expanduser(
+                "~/.local/share/opencode/project/*/storage/session/info/{sid}.json"),
+            os.path.expanduser(
+                "~/.local/share/opencode/storage/session/*/{sid}.json"),
+        ),
+        "activity_globs": (
+            os.path.expanduser(
+                "~/.local/share/opencode/project/*/storage/session/message/{sid}/*.json"),
+            os.path.expanduser(
+                "~/.local/share/opencode/project/*/storage/session/part/{sid}/*.json"),
+        ),
+        "num_ts_fields": ("created", "updated"),
+        "bin": "opencode",
+        "resume_argv": ["opencode", "--session", "{sid}"],
+        "session_in_args": r"(?:--session|-s)\s+(ses_\w+)",
+        "sid_re": r"ses_\w+",
+        "helper_tokens": (),
+        "replay_flags": (),
+        "sid_fn": "opencode",
+    },
+    "cursor": {
+        # cursor-agent chats: ~/.cursor/chats/<chatId>/<composer>/{meta,
+        # prompt_history}.json — meta.json carries cwd and ms epoch stamps.
+        "transcript_glob": os.path.expanduser(
+            "~/.cursor/chats/{sid}/*/meta.json"),
+        "activity_globs": (
+            os.path.expanduser("~/.cursor/chats/{sid}/*/*.json"),),
+        "num_ts_fields": ("createdAtMs", "updatedAtMs"),
+        "bin": "cursor-agent",
+        "resume_argv": ["cursor-agent", "--resume", "{sid}"],
+        "session_in_args": r"--resume\s+([0-9a-f]{32})",
+        "sid_re": r"[0-9a-f]{32}",
+        "helper_tokens": (),
+        "replay_flags": (),
+        "sid_fn": "cursor",
+    },
+    "devin": {
+        # Devin CLI. Session rows live in ~/.local/share/devin/cli/sessions.db
+        # (sqlite): id, working_directory, last_activity_at. The db row is the
+        # resume proof and the idle-age source; the transcript glob only feeds
+        # last-reply previews for sessions that were exported to a file.
+        "transcript_glob": os.path.expanduser(
+            "~/.local/share/devin/cli/transcripts/{sid}.json"),
+        "age_fn": "devin",
+        "bin": "devin",
+        "resume_argv": ["devin", "--resume", "{sid}"],
+        "session_in_args": r"(?:--resume|-r)\s+([A-Za-z0-9][A-Za-z0-9-]{2,79})",
+        "sid_re": r"[A-Za-z0-9][A-Za-z0-9-]{2,79}",
+        # `devin cloud` panes drive remote sessions — nothing local to resume.
+        "helper_tokens": ("cloud",),
+        "replay_flags": (),
+        "sid_fn": "devin",
+    },
+    "amp": {
+        # Sourcegraph Amp. Threads are local JSON: threads/T-<uuid>.json with
+        # "sentAt" ms stamps on messages and cwd in env.initial.trees[].uri.
+        "transcript_glob": os.path.expanduser(
+            "~/.local/share/amp/threads/{sid}.json"),
+        "num_ts_fields": ("sentAt", "created"),
+        "bin": "amp",
+        "resume_argv": ["amp", "threads", "continue", "{sid}"],
+        "session_in_args": r"threads\s+continue\s+(T-[0-9a-f-]{8,})",
+        "sid_re": r"T-[0-9a-f-]{8,}",
+        "helper_tokens": (),
+        "replay_flags": (),
+        "sid_fn": "amp",
     },
 }
 
@@ -410,11 +526,22 @@ def run_locked(func, *args, **kwargs):
 
 
 TS_RE = re.compile(rb'"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)')
-TS_EPOCH_RE = re.compile(rb'"timestamp"\s*:\s*(\d{9,12})\b')  # grok: epoch ints
 TAIL_BYTES = 2 * 1024 * 1024
 
+_NUM_TS_RES = {}
 
-def _stamp_epochs(chunk, allow_epoch=False):
+
+def _num_ts_re(field):
+    """Compiled `"<field>": <digits>` matcher, cached per field name."""
+    rx = _NUM_TS_RES.get(field)
+    if rx is None:
+        rx = re.compile(rb'"%s"\s*:\s*(\d{9,14})\b'
+                        % re.escape(field.encode("utf-8", "ignore")))
+        _NUM_TS_RES[field] = rx
+    return rx
+
+
+def _stamp_epochs(chunk, num_ts_fields=()):
     """All parseable entry timestamps in a transcript chunk, as epoch seconds."""
     out = []
     for iso in TS_RE.findall(chunk):
@@ -424,15 +551,17 @@ def _stamp_epochs(chunk, allow_epoch=False):
                               "%Y-%m-%dT%H:%M:%S")))
         except ValueError:
             pass
-    if allow_epoch:
-        for num in TS_EPOCH_RE.findall(chunk):
+    for field in num_ts_fields:
+        for num in _num_ts_re(field).findall(chunk):
             val = int(num)
-            if 1_000_000_000 <= val <= 4_102_444_800:  # sane range: 2001..2100
+            if val >= 1_000_000_000_000:  # epoch milliseconds
+                out.append(val // 1000)
+            elif 1_000_000_000 <= val <= 4_102_444_800:  # seconds: 2001..2100
                 out.append(val)
     return out
 
 
-def last_entry_epoch(path, allow_epoch=False):
+def last_entry_epoch(path, num_ts_fields=()):
     """Epoch of the newest timestamped entry in a transcript, or None.
 
     The file's mtime is NOT a usable idle signal: Claude Code keeps rewriting
@@ -446,13 +575,32 @@ def last_entry_epoch(path, allow_epoch=False):
         with open(path, "rb") as fh:
             if size > TAIL_BYTES:
                 fh.seek(size - TAIL_BYTES)
-            stamps = _stamp_epochs(fh.read(), allow_epoch)
+            stamps = _stamp_epochs(fh.read(), num_ts_fields)
             if not stamps and size > TAIL_BYTES:  # rare: no stamps in the tail
                 fh.seek(0)
-                stamps = _stamp_epochs(fh.read(), allow_epoch)
+                stamps = _stamp_epochs(fh.read(), num_ts_fields)
     except OSError:
         return None
     return max(stamps) if stamps else None
+
+
+def main_transcript_globs(spec):
+    """A spec's main transcript glob(s), always as a tuple."""
+    globs = spec["transcript_glob"]
+    return (globs,) if isinstance(globs, str) else tuple(globs)
+
+
+def valid_sid(agent, sid):
+    """True when sid exactly matches the agent's id shape.
+
+    `codex resume` accepts session NAMES as well as uuids; a loose id could
+    silently resolve to a different session. Only kill what we can name
+    exactly — each agent declares the strict shape of its resume token.
+    """
+    spec = AGENTS.get(agent)
+    if spec is None or not sid:
+        return False
+    return bool(re.fullmatch(spec.get("sid_re", UUID_RE), sid))
 
 
 def transcript_age_minutes(uuid, agent="claude"):
@@ -465,13 +613,17 @@ def transcript_age_minutes(uuid, agent="claude"):
     spec = AGENTS.get(agent)
     if spec is None:
         return None
-    patterns = (spec["transcript_glob"],) + tuple(spec.get("activity_globs", ()))
+    if spec.get("age_fn"):
+        fn = AGE_FNS.get(spec["age_fn"])
+        return fn(uuid, spec) if fn else None
+    main = main_transcript_globs(spec)
+    patterns = main + tuple(spec.get("activity_globs", ()))
     paths = [p for pat in patterns for p in glob.glob(pat.format(sid=uuid))]
-    if not glob.glob(spec["transcript_glob"].format(sid=uuid)):
+    if not any(glob.glob(pat.format(sid=uuid)) for pat in main):
         return None  # resumability needs the MAIN transcript, whatever else exists
     newest = None
     for path in paths:
-        stamp = last_entry_epoch(path, spec.get("epoch_ts", False))
+        stamp = last_entry_epoch(path, spec.get("num_ts_fields", ()))
         if stamp is None:  # unreadable/unstamped — fall back to the file clock
             try:
                 stamp = os.stat(path).st_mtime
@@ -509,10 +661,33 @@ def proc_uptime_minutes(pid):
         starttime_ticks = int(fields[19])  # field 22, 1-based, after comm
         with open("/proc/uptime") as fh:
             uptime = float(fh.read().split()[0])
+        ticks = os.sysconf("SC_CLK_TCK") or 100
+        return max(0.0, (uptime - starttime_ticks / ticks) / 60.0)
     except (OSError, IndexError, ValueError):
+        pass  # no /proc (macOS): fall through to `ps etime`
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "etime=", "-p", str(pid)],
+            capture_output=True, text=True).stdout.strip()
+        # [[dd-]hh:]mm:ss — the only elapsed form available on both systems
+        days, _, rest = out.rpartition("-")
+        parts = rest.split(":")
+        seconds = int(days or 0) * 86400 + sum(
+            int(p) * m for p, m in zip(parts, (3600, 60, 1)[3 - len(parts):]))
+        return max(0.0, seconds / 60.0)
+    except (OSError, ValueError):
         return None
-    ticks = os.sysconf("SC_CLK_TCK") or 100
-    return max(0.0, (uptime - starttime_ticks / ticks) / 60.0)
+
+
+def pid_alive(pid):
+    """True while pid exists — portable, unlike checking /proc."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    return True
 
 
 def descendants(root, procs):
@@ -578,9 +753,9 @@ def session_uuid(pane):
     sess = pane.get("agent_session")
     if isinstance(sess, dict) and sess.get("value"):
         return sess["value"]
-    if pane.get("agent") == "grok":
-        return grok_session_id(pane)
-    return None
+    spec = AGENTS.get(pane.get("agent") or "")
+    fn = SESSION_ID_FNS.get(spec.get("sid_fn", "")) if spec else None
+    return fn(pane) if fn else None
 
 
 def grok_session_id(pane):
@@ -623,6 +798,218 @@ def grok_session_id(pane):
         return entry.get("session_id")
     return None
 
+
+# ------------------------------------------------- cwd-keyed session lookup
+#
+# Herdr only reports agent_session for agents with a self-reporting
+# integration. For everyone else the session id is recovered from the agent's
+# own on-disk state, keyed by the pane's cwd. The candidates are ranked by
+# file mtime and the newest wins — the file a live session is writing is by
+# definition its freshest. When the two newest candidates are BOTH older than
+# the idle threshold the choice is genuinely ambiguous (two quiet sessions in
+# one directory — which one sits in this pane?), so the resolver abstains and
+# the pane is skipped: never kill on a guess.
+
+
+def _quiet_ambiguity(candidates, cfg=None):
+    """True when several candidates are all quiet — the live one is unknowable.
+
+    candidates: [(sid, mtime), ...] sorted newest first. With two or more
+    sessions whose transcripts all stopped writing before the hibernate
+    threshold, "the pane's session" could be any of them — abstain.
+    """
+    if len(candidates) < 2:
+        return False
+    threshold = float((cfg or DEFAULTS)["HIBERNATE_AFTER_MINUTES"])
+    quiet_before = time.time() - threshold * 60
+    quiet = [c for c in candidates if c[1] < quiet_before]
+    return len(quiet) >= 2
+
+
+def _dir_session_id(candidates):
+    """sid of the newest candidate, or None when quiet ones are ambiguous."""
+    if not candidates:
+        return None
+    candidates = sorted(candidates, key=lambda c: c[1], reverse=True)
+    if _quiet_ambiguity(candidates):
+        return None
+    return candidates[0][0]
+
+
+def droid_session_id(pane):
+    """Droid session = newest .jsonl in the pane's cwd session dir.
+
+    Droid keys session dirs by directory: ~/.factory/sessions/<dash-path> and
+    the <dash-path>-droid variant (project-scoped storage). The flat
+    ~/.factory/sessions/<uuid>.jsonl layout has no cwd binding, so it can
+    prove a transcript exists but never WHICH pane it belongs to.
+    """
+    cwd = pane.get("cwd")
+    if not cwd:
+        return None
+    slug = cwd.replace("/", "-")
+    base = os.path.expanduser("~/.factory/sessions")
+    cands = []
+    for d in (os.path.join(base, slug), os.path.join(base, slug + "-droid")):
+        for path in glob.glob(os.path.join(d, "*.jsonl")):
+            sid = os.path.splitext(os.path.basename(path))[0]
+            try:
+                cands.append((sid, os.path.getmtime(path)))
+            except OSError:
+                continue
+    return _dir_session_id(cands)
+
+
+def pi_session_id(pane):
+    """pi session = newest .jsonl under ~/.pi/agent/sessions/--<cwd-slug>--/."""
+    cwd = pane.get("cwd")
+    if not cwd:
+        return None
+    slug = "--%s--" % cwd.strip("/").replace("/", "-")
+    cands = []
+    for path in glob.glob(os.path.join(
+            os.path.expanduser("~/.pi/agent/sessions"), slug, "*.jsonl")):
+        name = os.path.splitext(os.path.basename(path))[0]
+        head, sep, sid = name.rpartition("_")
+        if not sep:  # timestamp_uuid.jsonl — no separator, no embedded id
+            continue
+        try:
+            cands.append((sid, os.path.getmtime(path)))
+        except OSError:
+            continue
+    return _dir_session_id(cands)
+
+
+def opencode_session_id(pane):
+    """opencode session = newest info/ses_*.json in the pane's project dir.
+
+    project/<cwd-slug> for project directories, project/global otherwise.
+    """
+    cwd = pane.get("cwd")
+    if not cwd:
+        return None
+    slug = cwd.strip("/").replace("/", "-")
+    root = os.path.expanduser("~/.local/share/opencode/project")
+    cands = []
+    for proj in (slug, "global"):
+        for path in glob.glob(os.path.join(
+                root, proj, "storage/session/info", "ses_*.json")):
+            sid = os.path.splitext(os.path.basename(path))[0]
+            try:
+                cands.append((sid, os.path.getmtime(path)))
+            except OSError:
+                continue
+        if cands:
+            break  # a real project dir wins over the global fallback
+    return _dir_session_id(cands)
+
+
+def cursor_session_id(pane):
+    """cursor-agent chat = newest chat dir whose meta.json names this cwd."""
+    cwd = pane.get("cwd")
+    if not cwd:
+        return None
+    cands = []
+    for meta in glob.glob(os.path.expanduser(
+            "~/.cursor/chats/*/*/meta.json")):
+        try:
+            with open(meta, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if data.get("cwd") != cwd:
+                continue
+            chat_id = os.path.basename(os.path.dirname(os.path.dirname(meta)))
+            cands.append((chat_id, os.path.getmtime(meta)))
+        except (OSError, ValueError):
+            continue
+    return _dir_session_id(cands)
+
+
+def devin_session_id(pane):
+    """Devin CLI session = newest sessions.db row for the pane's cwd.
+
+    Same-cwd Devin sessions are common (`devin list` shows them all), so the
+    usual ambiguity rule applies: several equally-quiet rows means the pane's
+    session cannot be told apart.
+    """
+    cwd = pane.get("cwd")
+    if not cwd:
+        return None
+    rows = _devin_db_all(
+        "SELECT id, last_activity_at FROM sessions "
+        "WHERE working_directory = ? ORDER BY last_activity_at DESC LIMIT 5",
+        (cwd,))
+    cands = [(r[0], r[1] / 1000.0 if r[1] and r[1] >= 1_000_000_000_000
+              else float(r[1] or 0)) for r in rows]
+    return _dir_session_id(cands)
+
+
+def devin_age_minutes(uuid, spec):
+    """Idle age from the db's own per-session activity clock, or None."""
+    row = _devin_db(
+        "SELECT last_activity_at FROM sessions WHERE id = ?", (uuid,))
+    if not row or row[0] is None:
+        return None
+    stamp = float(row[0])
+    if stamp >= 1_000_000_000_000:  # epoch milliseconds
+        stamp /= 1000.0
+    return max(0.0, (time.time() - stamp) / 60.0)
+
+
+def _devin_db(query, args):
+    """One row from Devin's sessions.db, read-only; None on any failure."""
+    rows = _devin_db_all(query, args)
+    return rows[0] if rows else None
+
+
+def _devin_db_all(query, args):
+    """Rows from Devin's sessions.db, read-only; [] on any failure."""
+    path = os.path.expanduser("~/.local/share/devin/cli/sessions.db")
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+        try:
+            return conn.execute(query, args).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+
+
+def amp_session_id(pane):
+    """Amp thread = newest T-*.json whose env names the pane's cwd as a tree."""
+    cwd = pane.get("cwd")
+    if not cwd:
+        return None
+    want = "file://" + cwd
+    cands = []
+    for path in glob.glob(os.path.expanduser(
+            "~/.local/share/amp/threads/T-*.json")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                env = (json.load(fh).get("env") or {}).get("initial") or {}
+            uris = [t.get("uri") for t in env.get("trees") or []
+                    if isinstance(t, dict)]
+            if want not in uris:
+                continue
+            sid = os.path.splitext(os.path.basename(path))[0]
+            cands.append((sid, os.path.getmtime(path)))
+        except (OSError, ValueError):
+            continue
+    return _dir_session_id(cands)
+
+
+SESSION_ID_FNS = {
+    "grok": grok_session_id,
+    "droid": droid_session_id,
+    "pi": pi_session_id,
+    "opencode": opencode_session_id,
+    "cursor": cursor_session_id,
+    "devin": devin_session_id,
+    "amp": amp_session_id,
+}
+
+AGE_FNS = {
+    "devin": devin_age_minutes,
+}
 
 _INTERPRETERS = ("node", "bun", "deno", "python", "python3")
 
@@ -791,10 +1178,11 @@ def classify(pane, tab_labels, cfg, state, self_pane):
     uuid = session_uuid(pane)
     if not uuid:
         return "skip", "no session uuid — could not resume, never killing"
-    if not re.fullmatch(UUID_RE, uuid):
-        # `codex resume` also accepts session NAMES; a non-uuid could silently
+    if not valid_sid(agent, uuid):
+        # `codex resume` also accepts session NAMES; a loose id could silently
         # resolve to a different session. Only kill what we can name exactly.
-        return "skip", "session id %r is not a uuid — never killing" % uuid[:40]
+        return "skip", "session id %r fails %s's shape — never killing" % (
+            uuid[:40], agent)
 
     age = transcript_age_minutes(uuid, agent)
     if age is None:
@@ -834,11 +1222,11 @@ def kill_tree(root, grace_seconds, protected, bin_name):
             pass
     deadline = time.time() + grace_seconds
     while time.time() < deadline:
-        if not any(os.path.exists("/proc/%d" % p) for p in targets):
+        if not any(pid_alive(p) for p in targets):
             break
         time.sleep(0.25)
     for pid in targets:
-        if os.path.exists("/proc/%d" % pid):
+        if pid_alive(pid):
             try:
                 os.kill(pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -1248,7 +1636,7 @@ def hibernate_pane(pane, tab_labels, cfg, state, idle_str, dry_run, force=False)
     # classify() proved a session id earlier, but for grok it is re-resolved
     # live (registry lookup) and could have vanished in between. A kill with
     # no resumable id must never happen, whatever the caller checked.
-    if not uuid or not re.fullmatch(UUID_RE, uuid):
+    if not uuid or not valid_sid(agent, uuid):
         log("SKIP %s (%s): no valid session id at kill time — never killing"
             % (label, pane_id))
         return False
@@ -1533,7 +1921,7 @@ def remember_chats(panes, tab_labels, full=True):
         chats = {} if full else load_json(CHATS_FILE, {})
         for pane in panes:
             agent, uuid = live_agent(pane), session_uuid(pane)
-            if agent not in AGENTS or not uuid or not re.fullmatch(UUID_RE, uuid):
+            if agent not in AGENTS or not uuid or not valid_sid(agent, uuid):
                 continue
             chats[pane["pane_id"]] = {
                 "tab_id": pane.get("tab_id", ""), "agent": agent, "uuid": uuid,
@@ -1635,7 +2023,8 @@ def drop_settled(uuid):
 def last_reply(uuid, agent):
     """The chat's last written reply as one line; None if its file is gone."""
     spec = AGENTS.get(agent)
-    paths = glob.glob(spec["transcript_glob"].format(sid=uuid)) if spec else []
+    paths = ([p for pat in main_transcript_globs(spec)
+              for p in glob.glob(pat.format(sid=uuid))] if spec else [])
     if not paths:
         return None
     try:
@@ -2223,8 +2612,8 @@ fi
 """ % SHELL_HOOK_MARK
 
 
-def install_shell_hook(rc=os.path.expanduser("~/.bashrc")):
-    """Add (or refresh) the .bashrc hook that re-arms stubs in fresh shells."""
+def _install_shell_hook(rc):
+    """Add (or refresh) the stub hook in one shell rc file."""
     try:
         with open(rc, encoding="utf-8") as fh:
             body = fh.read()
@@ -2244,6 +2633,20 @@ def install_shell_hook(rc=os.path.expanduser("~/.bashrc")):
     with open(rc, "w", encoding="utf-8") as fh:
         fh.write(body)
     return "%s shell hook in %s" % (action, rc)
+
+
+def install_shell_hook():
+    """Install the hook in each interactive rc the user's shells may read.
+
+    Panes run the user's own shell: bash reads ~/.bashrc, zsh reads
+    ~/.zshrc (the default on macOS). Cover .bashrc unconditionally and
+    .zshrc when it exists — the hook body is valid in both.
+    """
+    rcs = [os.path.expanduser("~/.bashrc")]
+    zshrc = os.path.expanduser("~/.zshrc")
+    if os.path.exists(zshrc):
+        rcs.append(zshrc)
+    return "; ".join(_install_shell_hook(rc) for rc in rcs)
 
 
 def cmd_status():
@@ -2308,6 +2711,13 @@ def watcher_pid():
         with open("/proc/%d/cmdline" % pid, "rb") as fh:
             if b"herdr-hibernate" in fh.read():
                 return pid
+    except OSError:
+        pass
+    try:  # no /proc (macOS): identify the pid by its args instead
+        out = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
+                             capture_output=True, text=True).stdout
+        if "herdr-hibernate" in out:
+            return pid
     except OSError:
         pass
     return None
@@ -2583,7 +2993,7 @@ def cmd_uninstall():
     if os.path.exists(PID_FILE):
         try:
             pid = int(open(PID_FILE).read().strip())
-            if os.path.exists("/proc/%d" % pid):
+            if pid_alive(pid):
                 os.kill(pid, signal.SIGTERM)
                 print("stopped watcher (pid %d)" % pid)
                 stopped = True

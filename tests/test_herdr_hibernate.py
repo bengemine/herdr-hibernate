@@ -827,5 +827,227 @@ class WatcherGuardTests(unittest.TestCase):
         self.assertTrue(reason.startswith("busy:"))
 
 
+class NewAgentAdapterTests(unittest.TestCase):
+    """Adapters for droid, pi, opencode, cursor, devin and amp."""
+
+    UUID = "01a02acb-6848-7db5-8cbb-9b8163e18c3e"
+    HEX32 = "59256306b3846fee39139da32939cc75"
+    CWD = "/tmp/demo-proj"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = mock.patch.dict(os.environ, {"HOME": self.tmp.name})
+        self.home.start()
+
+    def tearDown(self):
+        self.home.stop()
+        self.tmp.cleanup()
+
+    def _mk(self, rel, content=b"{}"):
+        path = os.path.join(self.tmp.name, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(content)
+        return path
+
+    def _touch(self, path, age_seconds):
+        ts = time.time() - age_seconds
+        os.utime(path, (ts, ts))
+
+    # -- session id shapes ------------------------------------------------
+
+    def test_sid_shape_gate_per_agent(self):
+        self.assertTrue(hibernate.valid_sid("claude", self.UUID))
+        self.assertTrue(hibernate.valid_sid("droid", self.UUID))
+        self.assertFalse(hibernate.valid_sid("droid", "not a uuid"))
+        self.assertTrue(hibernate.valid_sid("opencode", "ses_72d8abc"))
+        self.assertFalse(hibernate.valid_sid("opencode", self.UUID))
+        self.assertTrue(hibernate.valid_sid("cursor", self.HEX32))
+        self.assertFalse(hibernate.valid_sid("cursor", self.UUID))
+        self.assertTrue(hibernate.valid_sid("devin", "deadpan-squid"))
+        self.assertFalse(hibernate.valid_sid("devin", "two words"))
+        self.assertTrue(hibernate.valid_sid(
+            "amp", "T-ce40adae-e173-451f-a772-d56fc4cff3e1"))
+        self.assertFalse(hibernate.valid_sid("amp", self.UUID))
+        self.assertFalse(hibernate.valid_sid("hermes", self.UUID))
+
+    # -- numeric timestamp fields ------------------------------------------
+
+    def test_num_ts_fields_epoch_ms(self):
+        path = self._mk("t.jsonl",
+                        b'{"sentAt": %d}\n' % ((time.time() - 300) * 1000))
+        stamp = hibernate.last_entry_epoch(path, ("sentAt",))
+        self.assertAlmostEqual(stamp, time.time() - 300, delta=2)
+
+    def test_num_ts_fields_epoch_seconds(self):
+        path = self._mk("t.jsonl",
+                        b'{"timestamp": %d}\n' % (time.time() - 600))
+        stamp = hibernate.last_entry_epoch(path, ("timestamp",))
+        self.assertAlmostEqual(stamp, time.time() - 600, delta=2)
+
+    def test_num_ts_fields_mixed_with_iso(self):
+        # pi mixes ISO strings and ms ints on the same field name
+        path = self._mk("t.jsonl", (
+            b'{"timestamp":"%s"}\n'
+            b'{"timestamp":%d}\n'
+        ) % (time.strftime("%Y-%m-%dT%H:%M:%S",
+                           time.gmtime(time.time() - 900)).encode(),
+             int((time.time() - 60) * 1000)))
+        stamp = hibernate.last_entry_epoch(path, ("timestamp",))
+        self.assertAlmostEqual(stamp, time.time() - 60, delta=2)
+
+    # -- transcript globs ---------------------------------------------------
+
+    def test_multiple_main_globs_any_match_is_resumable(self):
+        spec = dict(hibernate.AGENTS["droid"])
+        spec["transcript_glob"] = (
+            os.path.join(self.tmp.name, "nested", "{sid}.jsonl"),
+            os.path.join(self.tmp.name, "flat", "{sid}.jsonl"),
+        )
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S",
+                              time.gmtime(time.time() - 3600))
+        self._mk("nested/%s.jsonl" % self.UUID,
+                 b'{"timestamp":"%s"}\n' % stamp.encode())
+        with mock.patch.dict(hibernate.AGENTS, {"droid": spec}):
+            age = hibernate.transcript_age_minutes(self.UUID, "droid")
+        self.assertIsNotNone(age)
+        self.assertGreater(age, 50)
+
+    # -- cwd-keyed resolvers ------------------------------------------------
+
+    def test_droid_resolves_newest_session_in_cwd_dir(self):
+        self._mk(".factory/sessions/-tmp-demo-proj/%s.jsonl" % self.UUID)
+        pane = {"cwd": self.CWD}
+        self.assertEqual(hibernate.droid_session_id(pane), self.UUID)
+
+    def test_droid_resolves_droid_suffixed_dir(self):
+        self._mk(".factory/sessions/-tmp-demo-proj-droid/%s.jsonl" % self.UUID)
+        pane = {"cwd": self.CWD}
+        self.assertEqual(hibernate.droid_session_id(pane), self.UUID)
+
+    def test_pi_resolves_uuid_from_filename(self):
+        self._mk(".pi/agent/sessions/--tmp-demo-proj--/"
+                 "2026-08-22T18-46-08-713Z_%s.jsonl" % self.UUID)
+        pane = {"cwd": self.CWD}
+        self.assertEqual(hibernate.pi_session_id(pane), self.UUID)
+
+    def test_opencode_resolves_ses_id_in_project_dir(self):
+        self._mk(".local/share/opencode/project/tmp-demo-proj/"
+                 "storage/session/info/ses_abc123.json")
+        pane = {"cwd": self.CWD}
+        self.assertEqual(hibernate.opencode_session_id(pane), "ses_abc123")
+
+    def test_opencode_falls_back_to_global_project(self):
+        self._mk(".local/share/opencode/project/global/"
+                 "storage/session/info/ses_glob1.json")
+        pane = {"cwd": self.CWD}
+        self.assertEqual(hibernate.opencode_session_id(pane), "ses_glob1")
+
+    def test_cursor_resolves_chat_by_meta_cwd(self):
+        self._mk(".cursor/chats/%s/e044a85d-2064-4367-aaf1-8bc501a6d5e7/"
+                 "meta.json" % self.HEX32,
+                 b'{"cwd": "%s", "updatedAtMs": 1}' % self.CWD.encode())
+        pane = {"cwd": self.CWD}
+        self.assertEqual(hibernate.cursor_session_id(pane), self.HEX32)
+
+    def test_cursor_ignores_chats_from_other_directories(self):
+        self._mk(".cursor/chats/%s/e044a85d/meta.json" % self.HEX32,
+                 b'{"cwd": "/elsewhere"}')
+        pane = {"cwd": self.CWD}
+        self.assertIsNone(hibernate.cursor_session_id(pane))
+
+    def test_devin_resolves_and_ages_from_sessions_db(self):
+        import sqlite3
+        db = os.path.join(self.tmp.name,
+                          ".local/share/devin/cli/sessions.db")
+        os.makedirs(os.path.dirname(db), exist_ok=True)
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, "
+                     "working_directory TEXT, last_activity_at INTEGER)")
+        old = int(time.time() - 7200)
+        conn.execute("INSERT INTO sessions VALUES (?, ?, ?)",
+                     ("deadpan-squid", self.CWD, old))
+        conn.execute("INSERT INTO sessions VALUES (?, ?, ?)",
+                     ("other-slug", "/elsewhere", old))
+        conn.commit()
+        conn.close()
+        pane = {"cwd": self.CWD}
+        self.assertEqual(hibernate.devin_session_id(pane), "deadpan-squid")
+        age = hibernate.devin_age_minutes("deadpan-squid", {})
+        self.assertGreater(age, 110)
+        self.assertLess(age, 130)
+
+    def test_devin_missing_db_is_skip_not_crash(self):
+        pane = {"cwd": self.CWD}
+        self.assertIsNone(hibernate.devin_session_id(pane))
+        self.assertIsNone(hibernate.devin_age_minutes("x-y", {}))
+
+    def test_devin_two_quiet_same_cwd_sessions_abstain(self):
+        import sqlite3
+        db = os.path.join(self.tmp.name,
+                          ".local/share/devin/cli/sessions.db")
+        os.makedirs(os.path.dirname(db), exist_ok=True)
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, "
+                     "working_directory TEXT, last_activity_at INTEGER)")
+        old = int(time.time() - 7200)
+        conn.execute("INSERT INTO sessions VALUES (?, ?, ?)",
+                     ("deadpan-squid", self.CWD, old))
+        conn.execute("INSERT INTO sessions VALUES (?, ?, ?)",
+                     ("cooing-gadget", self.CWD, old - 60))
+        conn.commit()
+        conn.close()
+        pane = {"cwd": self.CWD}
+        self.assertIsNone(hibernate.devin_session_id(pane))
+
+    def test_amp_resolves_thread_by_tree_uri(self):
+        tid = "T-ce40adae-e173-451f-a772-d56fc4cff3e1"
+        self._mk(".local/share/amp/threads/%s.json" % tid,
+                 b'{"env": {"initial": {"trees": [{"uri": "file://%s"}]}}}'
+                 % self.CWD.encode())
+        pane = {"cwd": self.CWD}
+        self.assertEqual(hibernate.amp_session_id(pane), tid)
+
+    # -- ambiguity: two quiet sessions in one directory are unknowable ------
+
+    def test_two_quiet_sessions_in_one_dir_abstain(self):
+        a = self._mk(".pi/agent/sessions/--tmp-demo-proj--/t1_%s.jsonl"
+                     % self.UUID)
+        b_uuid = "6f81d0e7-1111-2222-3333-444455556666"
+        b = self._mk(".pi/agent/sessions/--tmp-demo-proj--/t2_%s.jsonl"
+                     % b_uuid)
+        for p in (a, b):
+            self._touch(p, 3600)  # both older than the 30m default
+        pane = {"cwd": self.CWD}
+        self.assertIsNone(hibernate.pi_session_id(pane))
+
+    def test_one_quiet_one_active_resolves_the_active(self):
+        quiet = self._mk(".pi/agent/sessions/--tmp-demo-proj--/t1_%s.jsonl"
+                         % self.UUID)
+        self._touch(quiet, 3600)
+        active = self._mk(".pi/agent/sessions/--tmp-demo-proj--/t2_"
+                          "6f81d0e7-1111-2222-3333-444455556666.jsonl")
+        self._touch(active, 60)  # written a minute ago — the live session
+        pane = {"cwd": self.CWD}
+        self.assertEqual(hibernate.pi_session_id(pane),
+                         "6f81d0e7-1111-2222-3333-444455556666")
+
+    # -- dispatch ------------------------------------------------------------
+
+    def test_session_uuid_prefers_herdrs_own_report(self):
+        pane = {"agent": "pi", "agent_session": {"value": self.UUID},
+                "cwd": self.CWD}
+        self.assertEqual(hibernate.session_uuid(pane), self.UUID)
+
+    def test_session_uuid_falls_back_to_the_adapter_resolver(self):
+        self._mk(".pi/agent/sessions/--tmp-demo-proj--/t_%s.jsonl" % self.UUID)
+        pane = {"agent": "pi", "cwd": self.CWD}
+        self.assertEqual(hibernate.session_uuid(pane), self.UUID)
+
+    def test_session_uuid_unknown_agent_is_none(self):
+        pane = {"agent": "hermes", "cwd": self.CWD}
+        self.assertIsNone(hibernate.session_uuid(pane))
+
+
 if __name__ == "__main__":
     unittest.main()

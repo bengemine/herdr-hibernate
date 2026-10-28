@@ -1,12 +1,11 @@
 id = "bengemine.hibernate"
 name = "Herdr Hibernate"
-version = "1.4.0"
+version = "1.5.0"
 min_herdr_version = "0.7.0"
-description = "Hibernate idle Claude Code, Codex, and Grok panes to ~0 RAM — kill the process tree, leave a tiny resume stub, press Enter to get the exact session back."
-# Tested on Linux and WSL2. macOS is untested: the background watcher falls back
-# from systemd --user to a nohup loop, which should work there, but no macOS
-# machine has verified it yet. Reports welcome.
-platforms = ["linux"]
+description = "Hibernate idle coding-agent panes (Claude Code, Codex, Grok, Droid, pi, opencode, cursor-agent, Devin, Amp) to ~0 RAM — kill the process tree, leave a tiny resume stub, press Enter to get the exact session back."
+# Tested on Linux and WSL2. macOS uses the same nohup watcher fallback as
+# WSL2 (no systemd); pid/uptime checks are /proc-free as of 1.5.0.
+platforms = ["linux", "macos"]
 
 # Everything is one dependency-free Python 3 script; there is no build step.
 # State and config live in ~/.config/herdr-hibernate/ (not the plugin dirs) on
